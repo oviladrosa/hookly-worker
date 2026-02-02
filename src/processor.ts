@@ -40,28 +40,39 @@ function getIntensityMultiplier(intensity: "subtle" | "medium" | "strong"): numb
 }
 
 // Build hook effect filter
-function buildHookEffectFilter(effect: HookEffect): string {
+// Note: These effects are applied AFTER scaling to 1080x1920, so we work with that size
+function buildHookEffectFilter(effect: HookEffect, durationFrames: number = 90): string {
   const intensity = getIntensityMultiplier(effect.intensity)
+  // Use proper frame count for animations (default 3 seconds at 30fps = 90 frames)
+  const d = Math.max(durationFrames, 30)
 
   switch (effect.type) {
     case "zoom-in":
       // Gradual zoom in effect (Ken Burns style)
-      const zoomAmount = 1 + (0.1 * intensity)
-      return `zoompan=z='min(zoom+0.001*${intensity},${zoomAmount})':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s=1080x1920:fps=30`
+      // Zoom from 1.0 to 1.0 + (0.15 * intensity) over the duration
+      const zoomEnd = 1 + (0.15 * intensity)
+      const zoomIncrement = (zoomEnd - 1) / d
+      return `zoompan=z='min(1+on*${zoomIncrement},${zoomEnd})':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${d}:s=1080x1920:fps=30`
 
     case "punch-zoom":
-      // Quick punch zoom - zoom in then back
-      return `zoompan=z='if(lt(on,15),1+on*${0.02 * intensity},if(lt(on,30),${1 + 0.3 * intensity}-(on-15)*${0.02 * intensity},1))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s=1080x1920:fps=30`
+      // Quick punch zoom - zoom in fast then settle
+      // First 20% of frames: zoom from 1.0 to 1.0 + (0.2 * intensity)
+      // Rest: hold at that zoom
+      const punchZoom = 1 + (0.2 * intensity)
+      const punchFrames = Math.floor(d * 0.2)
+      return `zoompan=z='if(lt(on,${punchFrames}),1+on*${(punchZoom - 1) / punchFrames},${punchZoom})':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${d}:s=1080x1920:fps=30`
 
     case "vertical-pan":
-      // Slow vertical pan from top to bottom
-      const panSpeed = 2 * intensity
-      return `crop=1080:1920:0:'min(ih-1920,t*${panSpeed})'`
+      // Slow vertical pan - uses zoompan with y movement
+      // Start zoomed in slightly, pan from top to center
+      const panZoom = 1.1
+      const panAmount = Math.floor(1920 * 0.05 * intensity) // 5% of height * intensity
+      return `zoompan=z='${panZoom}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)-${panAmount}+on*${(panAmount * 2) / d}':d=${d}:s=1080x1920:fps=30`
 
     case "center-crop":
-      // Center crop with slight zoom
-      const cropZoom = 1.1 * intensity
-      return `scale=${Math.round(1080 * cropZoom)}:${Math.round(1920 * cropZoom)},crop=1080:1920`
+      // Center crop with slight zoom - scale up then crop back to 1080x1920
+      const cropZoom = 1 + (0.1 * intensity)
+      return `scale=${Math.round(1080 * cropZoom)}:${Math.round(1920 * cropZoom)},crop=1080:1920:(iw-1080)/2:(ih-1920)/2`
 
     default:
       return ""
@@ -91,21 +102,58 @@ function buildTransitionFilter(transition: Transition, hookDuration: number): st
   }
 }
 
+// Get video duration using ffprobe
+async function getVideoDuration(videoPath: string): Promise<number> {
+  return new Promise((resolve) => {
+    const ffprobe = spawn("ffprobe", [
+      "-v", "error",
+      "-select_streams", "v:0",
+      "-show_entries", "format=duration",
+      "-of", "default=noprint_wrappers=1:nokey=1",
+      videoPath
+    ])
+
+    let output = ""
+    ffprobe.stdout.on("data", (data) => {
+      output += data.toString()
+    })
+
+    ffprobe.on("close", () => {
+      const duration = parseFloat(output.trim())
+      resolve(isNaN(duration) ? 5 : duration) // Default to 5 seconds if probe fails
+    })
+
+    ffprobe.on("error", () => {
+      resolve(5) // Default to 5 seconds if ffprobe fails
+    })
+  })
+}
+
 // Build FFmpeg command for video concatenation with all effects
-function buildFFmpegArgs(
+async function buildFFmpegArgs(
   introPath: string,
   mainPath: string,
   outputPath: string,
   hookText: string | null,
   config: JobConfig | null | undefined
-): string[] {
+): Promise<string[]> {
   const args: string[] = ["-y"] // Overwrite output
 
-  // Handle hook trimming
+  // Get the actual intro video duration for effects and transitions
+  const introDuration = await getVideoDuration(introPath)
+
+  // Calculate hook duration (after any trimming)
+  let hookDuration: number
   if (config?.hookTrim && !config.hookTrim.useFullVideo) {
+    hookDuration = config.hookTrim.endTime - config.hookTrim.startTime
     args.push("-ss", config.hookTrim.startTime.toString())
-    args.push("-t", (config.hookTrim.endTime - config.hookTrim.startTime).toString())
+    args.push("-t", hookDuration.toString())
+  } else {
+    hookDuration = introDuration
   }
+
+  // Calculate frames for effects (30fps)
+  const hookFrames = Math.floor(hookDuration * 30)
 
   args.push("-i", introPath)
   args.push("-i", mainPath)
@@ -123,7 +171,7 @@ function buildFFmpegArgs(
 
   // Apply hook effect if specified
   if (config?.hookEffect && config.hookEffect.type !== "none") {
-    const effectFilter = buildHookEffectFilter(config.hookEffect)
+    const effectFilter = buildHookEffectFilter(config.hookEffect, hookFrames)
     if (effectFilter) {
       introFilter += "," + effectFilter
     }
@@ -171,12 +219,7 @@ function buildFFmpegArgs(
   const transition = config?.transition
 
   if (transition && transition.type !== "cut" && transition.duration > 0) {
-    // Get hook duration for transition timing
-    // We'll estimate based on trim or use a default
-    const hookDuration = config?.hookTrim && !config.hookTrim.useFullVideo
-      ? config.hookTrim.endTime - config.hookTrim.startTime
-      : 5 // Default estimate
-
+    // Use the already-calculated hookDuration for transition timing
     const transitionFilter = buildTransitionFilter(transition, hookDuration)
     if (transitionFilter) {
       filterParts.push(`[v0][v1]${transitionFilter}[outv]`)
@@ -323,7 +366,7 @@ export async function processJob(
     ])
 
     // Build and run FFmpeg command
-    const ffmpegArgs = buildFFmpegArgs(introPath, mainPath, outputPath, job.hook_text, job.config)
+    const ffmpegArgs = await buildFFmpegArgs(introPath, mainPath, outputPath, job.hook_text, job.config)
 
     if (job.hook_text) {
       const posInfo = job.config?.textPosition
