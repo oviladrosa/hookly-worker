@@ -8,11 +8,20 @@ export interface Transition {
   duration: number // milliseconds
 }
 
-// Hook effect types
-export type HookEffectType = "none" | "zoom-in" | "punch-zoom" | "vertical-pan" | "center-crop"
+// Effect types (used for both hook and demo)
+export type EffectType = "none" | "zoom-in" | "punch-zoom" | "vertical-pan" | "center-crop"
+
+// Keep HookEffectType as alias for backwards compatibility
+export type HookEffectType = EffectType
 
 export interface HookEffect {
   type: HookEffectType
+  intensity: "subtle" | "medium" | "strong"
+}
+
+// Demo effect (same options as hook effect)
+export interface DemoEffect {
+  type: EffectType
   intensity: "subtle" | "medium" | "strong"
 }
 
@@ -23,12 +32,35 @@ export interface HookTrim {
   useFullVideo: boolean
 }
 
+// Demo trimming
+export interface DemoTrim {
+  startTime: number
+  endTime: number
+  useFullVideo: boolean
+}
+
+// Text styling options
+export type FontSize = "small" | "medium" | "large"
+
+export interface TextStyle {
+  fontSize: FontSize
+  color: string
+  fontWeight?: "normal" | "bold"
+}
+
+// Audio source options
+export type AudioSource = "hook" | "demo" | "both" | "none"
+
 // Job configuration for video processing
 export interface JobConfig {
   hookTrim?: HookTrim
+  demoTrim?: DemoTrim
   transition?: Transition
   hookEffect?: HookEffect
+  demoEffect?: DemoEffect
+  textStyle?: TextStyle
   textPosition?: { x: number; y: number }
+  audioSource?: AudioSource
 }
 
 export interface VideoJob {

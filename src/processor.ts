@@ -3,7 +3,7 @@ import { writeFile, unlink, readFile, mkdir } from "fs/promises"
 import { existsSync } from "fs"
 import path from "path"
 import type { SupabaseClient } from "@supabase/supabase-js"
-import type { VideoJob, ProcessResult, JobConfig, HookEffect, Transition } from "./types"
+import type { VideoJob, ProcessResult, JobConfig, HookEffect, DemoEffect, Transition, TextStyle, FontSize, AudioSource } from "./types"
 
 const TMP_DIR = process.env.TMP_DIR || "/tmp/hookly"
 
@@ -39,9 +39,19 @@ function getIntensityMultiplier(intensity: "subtle" | "medium" | "strong"): numb
   }
 }
 
-// Build hook effect filter
+// Get font size in pixels
+function getFontSizePixels(fontSize: FontSize): number {
+  switch (fontSize) {
+    case "small": return 48
+    case "medium": return 72
+    case "large": return 96
+    default: return 72
+  }
+}
+
+// Build effect filter (used for both hook and demo)
 // Note: These effects are applied AFTER scaling to 1080x1920, so we work with that size
-function buildHookEffectFilter(effect: HookEffect, durationFrames: number = 90): string {
+function buildEffectFilter(effect: HookEffect | DemoEffect, durationFrames: number = 90): string {
   const intensity = getIntensityMultiplier(effect.intensity)
   // Use proper frame count for animations (default 3 seconds at 30fps = 90 frames)
   const d = Math.max(durationFrames, 30)
@@ -77,6 +87,11 @@ function buildHookEffectFilter(effect: HookEffect, durationFrames: number = 90):
     default:
       return ""
   }
+}
+
+// Legacy alias for backwards compatibility
+function buildHookEffectFilter(effect: HookEffect, durationFrames: number = 90): string {
+  return buildEffectFilter(effect, durationFrames)
 }
 
 // Build transition filter between hook and demo
@@ -139,30 +154,52 @@ async function buildFFmpegArgs(
 ): Promise<string[]> {
   const args: string[] = ["-y"] // Overwrite output
 
-  // Get the actual intro video duration for effects and transitions
+  // Get video durations for effects and transitions
   const introDuration = await getVideoDuration(introPath)
+  const mainDuration = await getVideoDuration(mainPath)
 
   // Calculate hook duration (after any trimming)
+  let hookStartTime = 0
   let hookDuration: number
   if (config?.hookTrim && !config.hookTrim.useFullVideo) {
+    hookStartTime = config.hookTrim.startTime
     hookDuration = config.hookTrim.endTime - config.hookTrim.startTime
-    args.push("-ss", config.hookTrim.startTime.toString())
-    args.push("-t", hookDuration.toString())
   } else {
     hookDuration = introDuration
   }
 
+  // Calculate demo duration (after any trimming)
+  let demoStartTime = 0
+  let demoDuration: number
+  if (config?.demoTrim && !config.demoTrim.useFullVideo) {
+    demoStartTime = config.demoTrim.startTime
+    demoDuration = config.demoTrim.endTime - config.demoTrim.startTime
+  } else {
+    demoDuration = mainDuration
+  }
+
   // Calculate frames for effects (30fps)
   const hookFrames = Math.floor(hookDuration * 30)
+  const demoFrames = Math.floor(demoDuration * 30)
 
+  // Add inputs (we handle trimming in the filter complex for more control)
   args.push("-i", introPath)
   args.push("-i", mainPath)
 
   // Build filter complex
   let filterParts: string[] = []
 
+  // Audio source setting (default to hook audio)
+  const audioSource: AudioSource = config?.audioSource || "hook"
+  const includeAudio = audioSource !== "none"
+
   // === INTRO VIDEO PROCESSING ===
   let introFilter = "[0:v]"
+
+  // Apply trimming first if needed
+  if (config?.hookTrim && !config.hookTrim.useFullVideo) {
+    introFilter += `trim=start=${hookStartTime}:end=${config.hookTrim.endTime},setpts=PTS-STARTPTS,`
+  }
 
   // Scale to TikTok format
   introFilter += "scale=1080:1920:force_original_aspect_ratio=decrease,"
@@ -177,7 +214,7 @@ async function buildFFmpegArgs(
     }
   }
 
-  // Add text overlay
+  // Add text overlay with styling from config
   if (hookText) {
     const escapedText = hookText
       .replace(/\\/g, "\\\\")
@@ -186,22 +223,30 @@ async function buildFFmpegArgs(
       .replace(/\[/g, "\\[")
       .replace(/\]/g, "\\]")
 
+    // Get text styling from config or use defaults
+    const fontSize = config?.textStyle?.fontSize ? getFontSizePixels(config.textStyle.fontSize) : 72
+    const fontColor = config?.textStyle?.color || "white"
+    const fontWeight = config?.textStyle?.fontWeight || "normal"
+
     // Use custom position if provided, otherwise center
     const textX = config?.textPosition ? `(w*${config.textPosition.x}/100)-(text_w/2)` : "(w-text_w)/2"
     const textY = config?.textPosition ? `(h*${config.textPosition.y}/100)-(text_h/2)` : "(h-text_h)/2"
 
     introFilter += `,drawtext=text='${escapedText}'`
-    introFilter += `:fontsize=72`
-    introFilter += `:fontcolor=white`
+    introFilter += `:fontsize=${fontSize}`
+    introFilter += `:fontcolor=${fontColor}`
     introFilter += `:x=${textX}`
     introFilter += `:y=${textY}`
-    introFilter += `:shadowcolor=black@0.7`
-    introFilter += `:shadowx=3`
-    introFilter += `:shadowy=3`
-    introFilter += `:enable='between(t,0,10)'` // Show for duration of hook
-    introFilter += `:box=1`
-    introFilter += `:boxcolor=black@0.5`
-    introFilter += `:boxborderw=15`
+    introFilter += `:borderw=3`
+    introFilter += `:bordercolor=black`
+    introFilter += `:shadowcolor=black@0.6`
+    introFilter += `:shadowx=4`
+    introFilter += `:shadowy=4`
+    introFilter += `:enable='between(t,0,${hookDuration})'`
+    // Use bold font if specified
+    if (fontWeight === "bold") {
+      introFilter += `:font=DejaVu Sans Bold`
+    }
   }
 
   introFilter += "[v0]"
@@ -209,41 +254,108 @@ async function buildFFmpegArgs(
 
   // === MAIN VIDEO PROCESSING ===
   let mainFilter = "[1:v]"
+
+  // Apply demo trimming first if needed
+  if (config?.demoTrim && !config.demoTrim.useFullVideo) {
+    mainFilter += `trim=start=${demoStartTime}:end=${config.demoTrim.endTime},setpts=PTS-STARTPTS,`
+  }
+
   mainFilter += "scale=1080:1920:force_original_aspect_ratio=decrease,"
   mainFilter += "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,"
   mainFilter += "setsar=1,fps=30"
+
+  // Apply demo effect if specified
+  if (config?.demoEffect && config.demoEffect.type !== "none") {
+    const effectFilter = buildEffectFilter(config.demoEffect, demoFrames)
+    if (effectFilter) {
+      mainFilter += "," + effectFilter
+    }
+  }
+
   mainFilter += "[v1]"
   filterParts.push(mainFilter)
+
+  // === AUDIO PROCESSING ===
+  if (includeAudio) {
+    // Process hook audio (trim if needed)
+    let hookAudioFilter = "[0:a]"
+    if (config?.hookTrim && !config.hookTrim.useFullVideo) {
+      hookAudioFilter += `atrim=start=${hookStartTime}:end=${config.hookTrim.endTime},asetpts=PTS-STARTPTS`
+    } else {
+      hookAudioFilter += "anull"
+    }
+    hookAudioFilter += "[a0]"
+    filterParts.push(hookAudioFilter)
+
+    // Process demo audio (trim if needed)
+    let demoAudioFilter = "[1:a]"
+    if (config?.demoTrim && !config.demoTrim.useFullVideo) {
+      demoAudioFilter += `atrim=start=${demoStartTime}:end=${config.demoTrim.endTime},asetpts=PTS-STARTPTS`
+    } else {
+      demoAudioFilter += "anull"
+    }
+    demoAudioFilter += "[a1]"
+    filterParts.push(demoAudioFilter)
+  }
 
   // === COMBINE VIDEOS ===
   const transition = config?.transition
 
   if (transition && transition.type !== "cut" && transition.duration > 0) {
-    // Use the already-calculated hookDuration for transition timing
     const transitionFilter = buildTransitionFilter(transition, hookDuration)
     if (transitionFilter) {
       filterParts.push(`[v0][v1]${transitionFilter}[outv]`)
     } else {
-      // Fallback to concat
       filterParts.push("[v0][v1]concat=n=2:v=1:a=0[outv]")
     }
   } else {
-    // Simple concat (cut transition)
     filterParts.push("[v0][v1]concat=n=2:v=1:a=0[outv]")
+  }
+
+  // === COMBINE AUDIO ===
+  if (includeAudio) {
+    switch (audioSource) {
+      case "hook":
+        // Use only hook audio, pad with silence for demo duration
+        const totalDuration = hookDuration + demoDuration
+        filterParts.push(`[a0]apad=whole_dur=${totalDuration}[outa]`)
+        break
+      case "demo":
+        // Add silence for hook duration, then demo audio
+        filterParts.push(`[a1]adelay=${Math.round(hookDuration * 1000)}|${Math.round(hookDuration * 1000)}[outa]`)
+        break
+      case "both":
+        // Concatenate both audio tracks
+        filterParts.push("[a0][a1]concat=n=2:v=0:a=1[outa]")
+        break
+    }
   }
 
   args.push("-filter_complex", filterParts.join(";"))
   args.push("-map", "[outv]")
 
-  // Output settings optimized for TikTok
+  // Map audio if included
+  if (includeAudio) {
+    args.push("-map", "[outa]")
+  }
+
+  // Output settings optimized for TikTok with improved quality
   args.push(
     "-c:v", "libx264",
-    "-preset", "medium",
-    "-crf", "23",
+    "-preset", "slow",        // Better quality (was: medium)
+    "-crf", "20",             // Higher quality (was: 23)
+    "-profile:v", "high",     // Better compatibility
+    "-level", "4.0",          // Good for mobile
     "-pix_fmt", "yuv420p",
-    "-movflags", "+faststart",
-    outputPath
+    "-movflags", "+faststart"
   )
+
+  // Add audio codec if included
+  if (includeAudio) {
+    args.push("-c:a", "aac", "-b:a", "128k")
+  }
+
+  args.push(outputPath)
 
   return args
 }
@@ -345,16 +457,28 @@ export async function processJob(
     if (job.config) {
       console.log(`   📋 Job config:`)
       if (job.config.hookTrim && !job.config.hookTrim.useFullVideo) {
-        console.log(`      - Trim: ${job.config.hookTrim.startTime}s - ${job.config.hookTrim.endTime}s`)
+        console.log(`      - Hook trim: ${job.config.hookTrim.startTime}s - ${job.config.hookTrim.endTime}s`)
+      }
+      if (job.config.demoTrim && !job.config.demoTrim.useFullVideo) {
+        console.log(`      - Demo trim: ${job.config.demoTrim.startTime}s - ${job.config.demoTrim.endTime}s`)
       }
       if (job.config.transition) {
         console.log(`      - Transition: ${job.config.transition.type} (${job.config.transition.duration}ms)`)
       }
       if (job.config.hookEffect && job.config.hookEffect.type !== "none") {
-        console.log(`      - Effect: ${job.config.hookEffect.type} (${job.config.hookEffect.intensity})`)
+        console.log(`      - Hook effect: ${job.config.hookEffect.type} (${job.config.hookEffect.intensity})`)
+      }
+      if (job.config.demoEffect && job.config.demoEffect.type !== "none") {
+        console.log(`      - Demo effect: ${job.config.demoEffect.type} (${job.config.demoEffect.intensity})`)
       }
       if (job.config.textPosition) {
         console.log(`      - Text position: (${job.config.textPosition.x}%, ${job.config.textPosition.y}%)`)
+      }
+      if (job.config.textStyle) {
+        console.log(`      - Text style: ${job.config.textStyle.fontSize}, ${job.config.textStyle.color}`)
+      }
+      if (job.config.audioSource) {
+        console.log(`      - Audio source: ${job.config.audioSource}`)
       }
     }
 
