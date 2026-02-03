@@ -144,6 +144,32 @@ async function getVideoDuration(videoPath: string): Promise<number> {
   })
 }
 
+// Check if video has an audio stream
+async function hasAudioStream(videoPath: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    const ffprobe = spawn("ffprobe", [
+      "-v", "error",
+      "-select_streams", "a:0",
+      "-show_entries", "stream=codec_type",
+      "-of", "default=noprint_wrappers=1:nokey=1",
+      videoPath
+    ])
+
+    let output = ""
+    ffprobe.stdout.on("data", (data) => {
+      output += data.toString()
+    })
+
+    ffprobe.on("close", () => {
+      resolve(output.trim() === "audio")
+    })
+
+    ffprobe.on("error", () => {
+      resolve(false)
+    })
+  })
+}
+
 // Build FFmpeg command for video concatenation with all effects
 async function buildFFmpegArgs(
   introPath: string,
@@ -181,6 +207,13 @@ async function buildFFmpegArgs(
   // Calculate frames for effects (30fps)
   const hookFrames = Math.floor(hookDuration * 30)
   const demoFrames = Math.floor(demoDuration * 30)
+
+  // Check if videos have audio streams
+  const [introHasAudio, mainHasAudio] = await Promise.all([
+    hasAudioStream(introPath),
+    hasAudioStream(mainPath)
+  ])
+  console.log(`   🔊 Audio streams - Hook: ${introHasAudio ? "yes" : "no (will use silence)"}, Demo: ${mainHasAudio ? "yes" : "no (will use silence)"}`)
 
   // Add inputs (we handle trimming in the filter complex for more control)
   args.push("-i", introPath)
@@ -277,25 +310,35 @@ async function buildFFmpegArgs(
 
   // === AUDIO PROCESSING ===
   if (includeAudio) {
-    // Process hook audio (trim if needed)
-    let hookAudioFilter = "[0:a]"
-    if (config?.hookTrim && !config.hookTrim.useFullVideo) {
-      hookAudioFilter += `atrim=start=${hookStartTime}:end=${config.hookTrim.endTime},asetpts=PTS-STARTPTS`
+    // Process hook audio (trim if needed, or generate silence if no audio stream)
+    if (introHasAudio) {
+      let hookAudioFilter = "[0:a]"
+      if (config?.hookTrim && !config.hookTrim.useFullVideo) {
+        hookAudioFilter += `atrim=start=${hookStartTime}:end=${config.hookTrim.endTime},asetpts=PTS-STARTPTS`
+      } else {
+        hookAudioFilter += "anull"
+      }
+      hookAudioFilter += "[a0]"
+      filterParts.push(hookAudioFilter)
     } else {
-      hookAudioFilter += "anull"
+      // Generate silent audio for hook duration
+      filterParts.push(`anullsrc=channel_layout=stereo:sample_rate=44100,atrim=0:${hookDuration}[a0]`)
     }
-    hookAudioFilter += "[a0]"
-    filterParts.push(hookAudioFilter)
 
-    // Process demo audio (trim if needed)
-    let demoAudioFilter = "[1:a]"
-    if (config?.demoTrim && !config.demoTrim.useFullVideo) {
-      demoAudioFilter += `atrim=start=${demoStartTime}:end=${config.demoTrim.endTime},asetpts=PTS-STARTPTS`
+    // Process demo audio (trim if needed, or generate silence if no audio stream)
+    if (mainHasAudio) {
+      let demoAudioFilter = "[1:a]"
+      if (config?.demoTrim && !config.demoTrim.useFullVideo) {
+        demoAudioFilter += `atrim=start=${demoStartTime}:end=${config.demoTrim.endTime},asetpts=PTS-STARTPTS`
+      } else {
+        demoAudioFilter += "anull"
+      }
+      demoAudioFilter += "[a1]"
+      filterParts.push(demoAudioFilter)
     } else {
-      demoAudioFilter += "anull"
+      // Generate silent audio for demo duration
+      filterParts.push(`anullsrc=channel_layout=stereo:sample_rate=44100,atrim=0:${demoDuration}[a1]`)
     }
-    demoAudioFilter += "[a1]"
-    filterParts.push(demoAudioFilter)
   }
 
   // === COMBINE VIDEOS ===
