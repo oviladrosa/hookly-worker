@@ -3,7 +3,7 @@ import { writeFile, unlink, readFile, mkdir } from "fs/promises"
 import { existsSync } from "fs"
 import path from "path"
 import type { SupabaseClient } from "@supabase/supabase-js"
-import type { VideoJob, ProcessResult, JobConfig, HookEffect, DemoEffect, Transition, TextStyle, FontSize, AudioSource } from "./types"
+import type { VideoJob, ProcessResult, JobConfig, HookEffect, DemoEffect, Transition, FontSize } from "./types"
 
 const TMP_DIR = process.env.TMP_DIR || "/tmp/hookly"
 
@@ -144,33 +144,7 @@ async function getVideoDuration(videoPath: string): Promise<number> {
   })
 }
 
-// Check if video has an audio stream
-async function hasAudioStream(videoPath: string): Promise<boolean> {
-  return new Promise((resolve) => {
-    const ffprobe = spawn("ffprobe", [
-      "-v", "error",
-      "-select_streams", "a:0",
-      "-show_entries", "stream=codec_type",
-      "-of", "default=noprint_wrappers=1:nokey=1",
-      videoPath
-    ])
-
-    let output = ""
-    ffprobe.stdout.on("data", (data) => {
-      output += data.toString()
-    })
-
-    ffprobe.on("close", () => {
-      resolve(output.trim() === "audio")
-    })
-
-    ffprobe.on("error", () => {
-      resolve(false)
-    })
-  })
-}
-
-// Build FFmpeg command for video concatenation with all effects
+// Build FFmpeg command for video concatenation with all effects (no audio)
 async function buildFFmpegArgs(
   introPath: string,
   mainPath: string,
@@ -196,35 +170,22 @@ async function buildFFmpegArgs(
 
   // Calculate demo duration (after any trimming)
   let demoStartTime = 0
-  let demoDuration: number
   if (config?.demoTrim && !config.demoTrim.useFullVideo) {
     demoStartTime = config.demoTrim.startTime
-    demoDuration = config.demoTrim.endTime - config.demoTrim.startTime
-  } else {
-    demoDuration = mainDuration
   }
 
   // Calculate frames for effects (30fps)
   const hookFrames = Math.floor(hookDuration * 30)
-  const demoFrames = Math.floor(demoDuration * 30)
+  const demoFrames = Math.floor((config?.demoTrim && !config.demoTrim.useFullVideo
+    ? config.demoTrim.endTime - config.demoTrim.startTime
+    : mainDuration) * 30)
 
-  // Check if videos have audio streams
-  const [introHasAudio, mainHasAudio] = await Promise.all([
-    hasAudioStream(introPath),
-    hasAudioStream(mainPath)
-  ])
-  console.log(`   🔊 Audio streams - Hook: ${introHasAudio ? "yes" : "no (will use silence)"}, Demo: ${mainHasAudio ? "yes" : "no (will use silence)"}`)
-
-  // Add inputs (we handle trimming in the filter complex for more control)
+  // Add inputs
   args.push("-i", introPath)
   args.push("-i", mainPath)
 
-  // Build filter complex
+  // Build filter complex (video only)
   let filterParts: string[] = []
-
-  // Audio source setting (default to hook audio)
-  const audioSource: AudioSource = config?.audioSource || "hook"
-  const includeAudio = audioSource !== "none"
 
   // === INTRO VIDEO PROCESSING ===
   let introFilter = "[0:v]"
@@ -308,47 +269,6 @@ async function buildFFmpegArgs(
   mainFilter += "[v1]"
   filterParts.push(mainFilter)
 
-  // === AUDIO PROCESSING ===
-  // Only create audio streams we actually need based on audioSource
-  if (includeAudio) {
-    const needHookAudio = audioSource === "hook" || audioSource === "both"
-    const needDemoAudio = audioSource === "demo" || audioSource === "both"
-
-    // Process hook audio (trim if needed, or generate silence if no audio stream)
-    if (needHookAudio) {
-      if (introHasAudio) {
-        let hookAudioFilter = "[0:a]"
-        if (config?.hookTrim && !config.hookTrim.useFullVideo) {
-          hookAudioFilter += `atrim=start=${hookStartTime}:end=${config.hookTrim.endTime},asetpts=PTS-STARTPTS`
-        } else {
-          hookAudioFilter += "anull"
-        }
-        hookAudioFilter += "[a0]"
-        filterParts.push(hookAudioFilter)
-      } else {
-        // Generate silent audio for hook duration
-        filterParts.push(`anullsrc=channel_layout=stereo:sample_rate=44100:duration=${hookDuration}[a0]`)
-      }
-    }
-
-    // Process demo audio (trim if needed, or generate silence if no audio stream)
-    if (needDemoAudio) {
-      if (mainHasAudio) {
-        let demoAudioFilter = "[1:a]"
-        if (config?.demoTrim && !config.demoTrim.useFullVideo) {
-          demoAudioFilter += `atrim=start=${demoStartTime}:end=${config.demoTrim.endTime},asetpts=PTS-STARTPTS`
-        } else {
-          demoAudioFilter += "anull"
-        }
-        demoAudioFilter += "[a1]"
-        filterParts.push(demoAudioFilter)
-      } else {
-        // Generate silent audio for demo duration
-        filterParts.push(`anullsrc=channel_layout=stereo:sample_rate=44100:duration=${demoDuration}[a1]`)
-      }
-    }
-  }
-
   // === COMBINE VIDEOS ===
   const transition = config?.transition
 
@@ -363,32 +283,11 @@ async function buildFFmpegArgs(
     filterParts.push("[v0][v1]concat=n=2:v=1:a=0[outv]")
   }
 
-  // === COMBINE AUDIO ===
-  if (includeAudio) {
-    switch (audioSource) {
-      case "hook":
-        // Use only hook audio, pad with silence for demo duration
-        const totalDuration = hookDuration + demoDuration
-        filterParts.push(`[a0]apad=whole_dur=${totalDuration}[outa]`)
-        break
-      case "demo":
-        // Add silence for hook duration, then demo audio
-        filterParts.push(`[a1]adelay=${Math.round(hookDuration * 1000)}|${Math.round(hookDuration * 1000)}[outa]`)
-        break
-      case "both":
-        // Concatenate both audio tracks
-        filterParts.push("[a0][a1]concat=n=2:v=0:a=1[outa]")
-        break
-    }
-  }
-
   args.push("-filter_complex", filterParts.join(";"))
   args.push("-map", "[outv]")
 
-  // Map audio if included
-  if (includeAudio) {
-    args.push("-map", "[outa]")
-  }
+  // No audio output
+  args.push("-an")
 
   // Output settings optimized for TikTok with improved quality
   args.push(
@@ -400,11 +299,6 @@ async function buildFFmpegArgs(
     "-pix_fmt", "yuv420p",
     "-movflags", "+faststart"
   )
-
-  // Add audio codec if included
-  if (includeAudio) {
-    args.push("-c:a", "aac", "-b:a", "128k")
-  }
 
   args.push(outputPath)
 
@@ -537,9 +431,6 @@ export async function processJob(
       }
       if (job.config.textStyle) {
         console.log(`      - Text style: ${job.config.textStyle.fontSize}, ${job.config.textStyle.color}`)
-      }
-      if (job.config.audioSource) {
-        console.log(`      - Audio source: ${job.config.audioSource}`)
       }
     }
 
