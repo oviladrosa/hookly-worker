@@ -289,11 +289,11 @@ async function buildFFmpegArgs(
   // No audio output
   args.push("-an")
 
-  // Output settings optimized for TikTok with improved quality
+  // Output settings optimized for TikTok (balanced quality/speed)
   args.push(
     "-c:v", "libx264",
-    "-preset", "slow",        // Better quality (was: medium)
-    "-crf", "20",             // Higher quality (was: 23)
+    "-preset", "medium",      // Balanced speed/quality (slow was causing timeouts)
+    "-crf", "22",             // Good quality (lower = better, 18-28 typical)
     "-profile:v", "high",     // Better compatibility
     "-level", "4.0",          // Good for mobile
     "-pix_fmt", "yuv420p",
@@ -305,7 +305,9 @@ async function buildFFmpegArgs(
   return args
 }
 
-// Run FFmpeg command
+// Run FFmpeg command with timeout
+const FFMPEG_TIMEOUT_MS = 5 * 60 * 1000 // 5 minutes
+
 function runFFmpeg(args: string[]): Promise<{ success: boolean; error?: string }> {
   return new Promise((resolve) => {
     console.log(`   🎬 Running FFmpeg...`)
@@ -319,16 +321,35 @@ function runFFmpeg(args: string[]): Promise<{ success: boolean; error?: string }
 
     const ffmpeg = spawn("ffmpeg", args)
     let stderr = ""
+    let resolved = false
+
+    // Set timeout to kill hung processes
+    const timeout = setTimeout(() => {
+      if (!resolved) {
+        resolved = true
+        console.error(`   ❌ FFmpeg timeout after ${FFMPEG_TIMEOUT_MS / 1000}s - killing process`)
+        ffmpeg.kill("SIGKILL")
+        resolve({ success: false, error: `FFmpeg timed out after ${FFMPEG_TIMEOUT_MS / 1000} seconds` })
+      }
+    }, FFMPEG_TIMEOUT_MS)
 
     ffmpeg.stderr.on("data", (data) => {
       stderr += data.toString()
     })
 
     ffmpeg.on("error", (error) => {
-      resolve({ success: false, error: `FFmpeg failed to start: ${error.message}` })
+      if (!resolved) {
+        resolved = true
+        clearTimeout(timeout)
+        resolve({ success: false, error: `FFmpeg failed to start: ${error.message}` })
+      }
     })
 
     ffmpeg.on("close", (code) => {
+      if (resolved) return
+      resolved = true
+      clearTimeout(timeout)
+
       if (code === 0) {
         console.log(`   ✓ FFmpeg completed successfully`)
         resolve({ success: true })
