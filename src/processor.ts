@@ -309,35 +309,43 @@ async function buildFFmpegArgs(
   filterParts.push(mainFilter)
 
   // === AUDIO PROCESSING ===
+  // Only create audio streams we actually need based on audioSource
   if (includeAudio) {
+    const needHookAudio = audioSource === "hook" || audioSource === "both"
+    const needDemoAudio = audioSource === "demo" || audioSource === "both"
+
     // Process hook audio (trim if needed, or generate silence if no audio stream)
-    if (introHasAudio) {
-      let hookAudioFilter = "[0:a]"
-      if (config?.hookTrim && !config.hookTrim.useFullVideo) {
-        hookAudioFilter += `atrim=start=${hookStartTime}:end=${config.hookTrim.endTime},asetpts=PTS-STARTPTS`
+    if (needHookAudio) {
+      if (introHasAudio) {
+        let hookAudioFilter = "[0:a]"
+        if (config?.hookTrim && !config.hookTrim.useFullVideo) {
+          hookAudioFilter += `atrim=start=${hookStartTime}:end=${config.hookTrim.endTime},asetpts=PTS-STARTPTS`
+        } else {
+          hookAudioFilter += "anull"
+        }
+        hookAudioFilter += "[a0]"
+        filterParts.push(hookAudioFilter)
       } else {
-        hookAudioFilter += "anull"
+        // Generate silent audio for hook duration
+        filterParts.push(`anullsrc=channel_layout=stereo:sample_rate=44100:duration=${hookDuration}[a0]`)
       }
-      hookAudioFilter += "[a0]"
-      filterParts.push(hookAudioFilter)
-    } else {
-      // Generate silent audio for hook duration
-      filterParts.push(`anullsrc=channel_layout=stereo:sample_rate=44100,atrim=0:${hookDuration}[a0]`)
     }
 
     // Process demo audio (trim if needed, or generate silence if no audio stream)
-    if (mainHasAudio) {
-      let demoAudioFilter = "[1:a]"
-      if (config?.demoTrim && !config.demoTrim.useFullVideo) {
-        demoAudioFilter += `atrim=start=${demoStartTime}:end=${config.demoTrim.endTime},asetpts=PTS-STARTPTS`
+    if (needDemoAudio) {
+      if (mainHasAudio) {
+        let demoAudioFilter = "[1:a]"
+        if (config?.demoTrim && !config.demoTrim.useFullVideo) {
+          demoAudioFilter += `atrim=start=${demoStartTime}:end=${config.demoTrim.endTime},asetpts=PTS-STARTPTS`
+        } else {
+          demoAudioFilter += "anull"
+        }
+        demoAudioFilter += "[a1]"
+        filterParts.push(demoAudioFilter)
       } else {
-        demoAudioFilter += "anull"
+        // Generate silent audio for demo duration
+        filterParts.push(`anullsrc=channel_layout=stereo:sample_rate=44100:duration=${demoDuration}[a1]`)
       }
-      demoAudioFilter += "[a1]"
-      filterParts.push(demoAudioFilter)
-    } else {
-      // Generate silent audio for demo duration
-      filterParts.push(`anullsrc=channel_layout=stereo:sample_rate=44100,atrim=0:${demoDuration}[a1]`)
     }
   }
 
@@ -409,6 +417,12 @@ function runFFmpeg(args: string[]): Promise<{ success: boolean; error?: string }
     console.log(`   🎬 Running FFmpeg...`)
     console.log(`   Command: ffmpeg ${args.join(" ").slice(0, 200)}...`)
 
+    // Log the filter_complex for debugging
+    const filterIdx = args.indexOf("-filter_complex")
+    if (filterIdx !== -1 && args[filterIdx + 1]) {
+      console.log(`   Filter: ${args[filterIdx + 1].slice(0, 500)}...`)
+    }
+
     const ffmpeg = spawn("ffmpeg", args)
     let stderr = ""
 
@@ -425,11 +439,15 @@ function runFFmpeg(args: string[]): Promise<{ success: boolean; error?: string }
         console.log(`   ✓ FFmpeg completed successfully`)
         resolve({ success: true })
       } else {
-        // Extract error from stderr
+        // Extract error from stderr - look for lines with error keywords
         const errorLines = stderr.split("\n").filter(
-          (line) => line.includes("Error") || line.includes("error")
+          (line) => line.includes("Error") || line.includes("error") || line.includes("Invalid") || line.includes("No such")
         )
-        const errorMessage = errorLines.slice(-3).join("; ") || `FFmpeg exited with code ${code}`
+        // If no specific error lines found, get the last few lines of stderr
+        const lastLines = stderr.split("\n").filter(l => l.trim()).slice(-5)
+        const errorMessage = errorLines.length > 0
+          ? errorLines.slice(-3).join("; ")
+          : lastLines.join("; ") || `FFmpeg exited with code ${code}`
         console.error(`   ❌ FFmpeg error: ${errorMessage}`)
         resolve({ success: false, error: errorMessage })
       }
