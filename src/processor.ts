@@ -51,36 +51,49 @@ function getFontSizePixels(fontSize: FontSize): number {
 
 // Build effect filter (used for both hook and demo)
 // Note: These effects are applied AFTER scaling to 1080x1920, so we work with that size
+// IMPORTANT: zoompan is CPU-intensive - it generates frames, not modifies them
+// We cap duration to prevent timeouts on longer videos
 function buildEffectFilter(effect: HookEffect | DemoEffect, durationFrames: number = 90): string {
   const intensity = getIntensityMultiplier(effect.intensity)
-  // Use proper frame count for animations (default 3 seconds at 30fps = 90 frames)
-  const d = Math.max(durationFrames, 30)
+
+  // Cap zoompan duration to prevent timeouts
+  // zoompan generates new frames for each output frame, which is very CPU-intensive
+  // Max 5 seconds (150 frames at 30fps) for Ken Burns effects, 2 seconds (60 frames) for quick effects
+  const MAX_ZOOMPAN_FRAMES_LONG = 150  // 5 seconds - for gradual effects
+  const MAX_ZOOMPAN_FRAMES_SHORT = 60  // 2 seconds - for quick effects like punch-zoom
 
   switch (effect.type) {
     case "zoom-in":
       // Gradual zoom in effect (Ken Burns style)
       // Zoom from 1.0 to 1.0 + (0.15 * intensity) over the duration
+      // Cap at 5 seconds to prevent CPU overload
+      const zoomD = Math.min(Math.max(durationFrames, 30), MAX_ZOOMPAN_FRAMES_LONG)
       const zoomEnd = 1 + (0.15 * intensity)
-      const zoomIncrement = (zoomEnd - 1) / d
-      return `zoompan=z='min(1+on*${zoomIncrement},${zoomEnd})':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${d}:s=1080x1920:fps=30`
+      const zoomIncrement = (zoomEnd - 1) / zoomD
+      return `zoompan=z='min(1+on*${zoomIncrement},${zoomEnd})':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${zoomD}:s=1080x1920:fps=30`
 
     case "punch-zoom":
       // Quick punch zoom - zoom in fast then settle
+      // This is meant to be a QUICK effect, so cap at 2 seconds
       // First 20% of frames: zoom from 1.0 to 1.0 + (0.2 * intensity)
       // Rest: hold at that zoom
+      const punchD = Math.min(Math.max(durationFrames, 30), MAX_ZOOMPAN_FRAMES_SHORT)
       const punchZoom = 1 + (0.2 * intensity)
-      const punchFrames = Math.floor(d * 0.2)
-      return `zoompan=z='if(lt(on,${punchFrames}),1+on*${(punchZoom - 1) / punchFrames},${punchZoom})':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${d}:s=1080x1920:fps=30`
+      const punchFrames = Math.floor(punchD * 0.2)
+      return `zoompan=z='if(lt(on,${punchFrames}),1+on*${(punchZoom - 1) / punchFrames},${punchZoom})':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${punchD}:s=1080x1920:fps=30`
 
     case "vertical-pan":
       // Slow vertical pan - uses zoompan with y movement
       // Start zoomed in slightly, pan from top to center
+      // Cap at 5 seconds for gradual pan
+      const panD = Math.min(Math.max(durationFrames, 30), MAX_ZOOMPAN_FRAMES_LONG)
       const panZoom = 1.1
       const panAmount = Math.floor(1920 * 0.05 * intensity) // 5% of height * intensity
-      return `zoompan=z='${panZoom}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)-${panAmount}+on*${(panAmount * 2) / d}':d=${d}:s=1080x1920:fps=30`
+      return `zoompan=z='${panZoom}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)-${panAmount}+on*${(panAmount * 2) / panD}':d=${panD}:s=1080x1920:fps=30`
 
     case "center-crop":
       // Center crop with slight zoom - scale up then crop back to 1080x1920
+      // This uses scale+crop, NOT zoompan, so it's fast and doesn't need capping
       const cropZoom = 1 + (0.1 * intensity)
       return `scale=${Math.round(1080 * cropZoom)}:${Math.round(1920 * cropZoom)},crop=1080:1920:(iw-1080)/2:(ih-1920)/2`
 
