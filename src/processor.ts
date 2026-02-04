@@ -50,50 +50,22 @@ function getFontSizePixels(fontSize: FontSize): number {
 }
 
 // Build effect filter (used for both hook and demo)
-// Note: These effects are applied AFTER scaling to 1080x1920, so we work with that size
-// IMPORTANT: zoompan is CPU-intensive - it generates frames, not modifies them
-// We cap duration to prevent timeouts on longer videos
-function buildEffectFilter(effect: HookEffect | DemoEffect, durationFrames: number = 90): string {
+// SIMPLIFIED: Only fast, non-CPU-intensive effects
+// All zoompan effects removed - they're too slow and break video duration
+function buildEffectFilter(effect: HookEffect | DemoEffect): string {
   const intensity = getIntensityMultiplier(effect.intensity)
-
-  // Cap zoompan duration to prevent timeouts
-  // zoompan generates new frames for each output frame, which is very CPU-intensive
-  // Max 5 seconds (150 frames at 30fps) for Ken Burns effects, 2 seconds (60 frames) for quick effects
-  const MAX_ZOOMPAN_FRAMES_LONG = 150  // 5 seconds - for gradual effects
-  const MAX_ZOOMPAN_FRAMES_SHORT = 60  // 2 seconds - for quick effects like punch-zoom
 
   switch (effect.type) {
     case "zoom-in":
-      // Gradual zoom in effect (Ken Burns style)
-      // Zoom from 1.0 to 1.0 + (0.15 * intensity) over the duration
-      // Cap at 5 seconds to prevent CPU overload
-      const zoomD = Math.min(Math.max(durationFrames, 30), MAX_ZOOMPAN_FRAMES_LONG)
-      const zoomEnd = 1 + (0.15 * intensity)
-      const zoomIncrement = (zoomEnd - 1) / zoomD
-      return `zoompan=z='min(1+on*${zoomIncrement},${zoomEnd})':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${zoomD}:s=1080x1920:fps=30`
-
     case "punch-zoom":
-      // Quick punch zoom - zoom in fast then settle
-      // This is meant to be a QUICK effect, so cap at 2 seconds
-      // First 20% of frames: zoom from 1.0 to 1.0 + (0.2 * intensity)
-      // Rest: hold at that zoom
-      const punchD = Math.min(Math.max(durationFrames, 30), MAX_ZOOMPAN_FRAMES_SHORT)
-      const punchZoom = 1 + (0.2 * intensity)
-      const punchFrames = Math.floor(punchD * 0.2)
-      return `zoompan=z='if(lt(on,${punchFrames}),1+on*${(punchZoom - 1) / punchFrames},${punchZoom})':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${punchD}:s=1080x1920:fps=30`
-
     case "vertical-pan":
-      // Slow vertical pan - uses zoompan with y movement
-      // Start zoomed in slightly, pan from top to center
-      // Cap at 5 seconds for gradual pan
-      const panD = Math.min(Math.max(durationFrames, 30), MAX_ZOOMPAN_FRAMES_LONG)
-      const panZoom = 1.1
-      const panAmount = Math.floor(1920 * 0.05 * intensity) // 5% of height * intensity
-      return `zoompan=z='${panZoom}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)-${panAmount}+on*${(panAmount * 2) / panD}':d=${panD}:s=1080x1920:fps=30`
+      // These used zoompan which is extremely CPU-intensive and breaks video duration
+      // For now, fall back to a simple center-crop effect which is fast
+      const fallbackZoom = 1 + (0.05 * intensity)
+      return `scale=${Math.round(1080 * fallbackZoom)}:${Math.round(1920 * fallbackZoom)},crop=1080:1920:(iw-1080)/2:(ih-1920)/2`
 
     case "center-crop":
-      // Center crop with slight zoom - scale up then crop back to 1080x1920
-      // This uses scale+crop, NOT zoompan, so it's fast and doesn't need capping
+      // Simple scale+crop - fast and reliable
       const cropZoom = 1 + (0.1 * intensity)
       return `scale=${Math.round(1080 * cropZoom)}:${Math.round(1920 * cropZoom)},crop=1080:1920:(iw-1080)/2:(ih-1920)/2`
 
@@ -103,8 +75,8 @@ function buildEffectFilter(effect: HookEffect | DemoEffect, durationFrames: numb
 }
 
 // Legacy alias for backwards compatibility
-function buildHookEffectFilter(effect: HookEffect, durationFrames: number = 90): string {
-  return buildEffectFilter(effect, durationFrames)
+function buildHookEffectFilter(effect: HookEffect): string {
+  return buildEffectFilter(effect)
 }
 
 // Build transition filter between hook and demo
@@ -167,9 +139,8 @@ async function buildFFmpegArgs(
 ): Promise<string[]> {
   const args: string[] = ["-y"] // Overwrite output
 
-  // Get video durations for effects and transitions
+  // Get intro duration for text overlay timing and transitions
   const introDuration = await getVideoDuration(introPath)
-  const mainDuration = await getVideoDuration(mainPath)
 
   // Calculate hook duration (after any trimming)
   let hookStartTime = 0
@@ -186,12 +157,6 @@ async function buildFFmpegArgs(
   if (config?.demoTrim && !config.demoTrim.useFullVideo) {
     demoStartTime = config.demoTrim.startTime
   }
-
-  // Calculate frames for effects (30fps)
-  const hookFrames = Math.floor(hookDuration * 30)
-  const demoFrames = Math.floor((config?.demoTrim && !config.demoTrim.useFullVideo
-    ? config.demoTrim.endTime - config.demoTrim.startTime
-    : mainDuration) * 30)
 
   // Add inputs
   args.push("-i", introPath)
@@ -215,7 +180,7 @@ async function buildFFmpegArgs(
 
   // Apply hook effect if specified
   if (config?.hookEffect && config.hookEffect.type !== "none") {
-    const effectFilter = buildHookEffectFilter(config.hookEffect, hookFrames)
+    const effectFilter = buildHookEffectFilter(config.hookEffect)
     if (effectFilter) {
       introFilter += "," + effectFilter
     }
@@ -273,7 +238,7 @@ async function buildFFmpegArgs(
 
   // Apply demo effect if specified
   if (config?.demoEffect && config.demoEffect.type !== "none") {
-    const effectFilter = buildEffectFilter(config.demoEffect, demoFrames)
+    const effectFilter = buildEffectFilter(config.demoEffect)
     if (effectFilter) {
       mainFilter += "," + effectFilter
     }
@@ -302,13 +267,14 @@ async function buildFFmpegArgs(
   // No audio output
   args.push("-an")
 
-  // Output settings optimized for TikTok (balanced quality/speed)
+  // Output settings optimized for FAST processing and small file size
+  // TikTok compresses videos anyway, so we prioritize speed over quality
   args.push(
     "-c:v", "libx264",
-    "-preset", "medium",      // Balanced speed/quality (slow was causing timeouts)
-    "-crf", "22",             // Good quality (lower = better, 18-28 typical)
-    "-profile:v", "high",     // Better compatibility
-    "-level", "4.0",          // Good for mobile
+    "-preset", "veryfast",    // Fast encoding (ultrafast/superfast/veryfast/faster/fast/medium)
+    "-crf", "26",             // Smaller file size, good enough for social media (18-28 range)
+    "-profile:v", "main",     // Good compatibility with mobile devices
+    "-level", "4.0",
     "-pix_fmt", "yuv420p",
     "-movflags", "+faststart"
   )
@@ -319,7 +285,7 @@ async function buildFFmpegArgs(
 }
 
 // Run FFmpeg command with timeout
-const FFMPEG_TIMEOUT_MS = 5 * 60 * 1000 // 5 minutes
+const FFMPEG_TIMEOUT_MS = 2 * 60 * 1000 // 2 minutes (should be plenty with simplified processing)
 
 function runFFmpeg(args: string[]): Promise<{ success: boolean; error?: string }> {
   return new Promise((resolve) => {
